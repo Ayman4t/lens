@@ -165,6 +165,7 @@
             <input id="steady" type="range" min="0" max="100" value="80" />
           </label>
 
+          <label class="flex items-center justify-between text-sm"><span>Sync picture to tracking</span><input id="tSync" type="checkbox" checked class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Eye markers</span><input id="tEyes" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Face outline</span><input id="tOutline" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Raw (unsmoothed) points</span><input id="tRaw" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
@@ -218,6 +219,7 @@ const settings = {
   glide: 0.06,        // camera follow speed (per 60 FPS frame)
   intensity: 0.85,    // eye-contact correction strength 0..1
   lid: 0.7,           // eyelid lift 0..1 (lowered lids are raised toward a relaxed open eye)
+  sync: true,         // draw the exact camera frame the face model analysed (no lag between picture and eyes)
   steady: 0.8,        // 0..1 eye steadiness: higher = eyes hold still, lower = follows tiny movements
   eyeFix: true,
   showEyes: false, showOutline: false, showRaw: false, autoFrame: true,
@@ -233,6 +235,7 @@ function bindUI() {
     settings.intensity  = $('intensity').value / 100;
     settings.lid        = $('lid').value / 100;
     settings.steady     = $('steady').value / 100;
+    settings.sync       = $('tSync').checked;
     settings.eyeFix      = $('tEyeFix').checked;
     settings.showEyes    = $('tEyes').checked;
     settings.showOutline = $('tOutline').checked;
@@ -421,8 +424,8 @@ const oeAlpha = (fc, dt) => { const tau = 1 / (2 * Math.PI * fc); return 1 / (1 
 function stabilizeEye(eye, pts, k) {
   const dt = Math.max(0.004, k / 60);                       // seconds since last render frame
   const s = settings.steady;
-  const minCut = lerp(6, 0.35, s);                          // Hz at rest
-  const beta = 0.02;                                        // opens up with speed (px/s)
+  const minCut = lerp(6, 1.0, s);                          // Hz at rest
+  const beta = 0.06;                                        // opens up with speed (px/s)
   const ids = eye.contour.concat(eye.iris);
   if (!eye.stab || performance.now() - eye.stab.t > 300) {  // first frame / face re-acquired: snap
     eye.stab = { t: 0, p: {} };
@@ -720,10 +723,15 @@ function drawMinimap(box) {
    buttery even when the model runs slower than the screen refresh.
    =========================================================================== */
 let latestRaw = null, lastFaceTime = 0;
+let latestFrame = null, latestFrameT = 0, inflightFrame = null;   // the exact frame behind `latestRaw`
 let aiFrames = 0, renderFrames = 0, lastFpsT = performance.now();
 
 function onResults(results) {
   aiFrames++;
+  if (inflightFrame) {                       // this result belongs to that exact camera frame
+    if (latestFrame) latestFrame.close();
+    latestFrame = inflightFrame; inflightFrame = null; latestFrameT = performance.now();
+  }
   const raw = results.multiFaceLandmarks && results.multiFaceLandmarks[0];
   latestRaw = raw || null;
   if (raw) lastFaceTime = performance.now();
@@ -757,7 +765,8 @@ function render(now) {
   // --- 1. draw cropped, mirrored video ---
   ctx.save();
   ctx.translate(W, 0); ctx.scale(-1, 1);
-  ctx.drawImage(video, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, W, H);
+  const src = (settings.sync && latestFrame && latestFrame.width === vw && now - latestFrameT < 250) ? latestFrame : video;
+  ctx.drawImage(src, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, W, H);
   ctx.restore();
 
   // --- 2. eye contact correction (before overlays so markers draw on top) ---
@@ -866,7 +875,6 @@ function startRecording() {
 
   rec.mime = pickMime();
   rec.chunks = [];
-  grabFrame(); // make sure the stream starts with a real picture
 
   try {
     rec.stream = recCv.captureStream(30);
@@ -991,7 +999,12 @@ async function start() {
     const infer = async () => {
       if (!busy && video.readyState >= 2) {
         busy = true;
-        try { await faceMesh.send({ image: video }); } catch (e) { console.error(e); }
+        try {
+          const bmp = await createImageBitmap(video);   // freeze this frame so picture and landmarks match
+          inflightFrame = bmp;
+          await faceMesh.send({ image: bmp });
+          if (inflightFrame === bmp) { bmp.close(); inflightFrame = null; }
+        } catch (e) { console.error(e); if (inflightFrame) { inflightFrame.close(); inflightFrame = null; } }
         busy = false;
       }
       requestAnimationFrame(infer);
