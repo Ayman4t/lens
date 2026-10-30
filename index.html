@@ -118,7 +118,7 @@
 
           <label class="block text-sm">
             <div class="flex justify-between mb-1"><span>Correction intensity</span><span id="intLbl" class="text-slate-500 font-mono text-xs"></span></div>
-            <input id="intensity" type="range" min="0" max="100" value="85" />
+            <input id="intensity" type="range" min="0" max="100" value="100" />
           </label>
 
           <label class="block text-sm">
@@ -165,7 +165,6 @@
             <input id="steady" type="range" min="0" max="100" value="80" />
           </label>
 
-          <label class="flex items-center justify-between text-sm"><span>Sync picture to tracking</span><input id="tSync" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Eye markers</span><input id="tEyes" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Face outline</span><input id="tOutline" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Raw (unsmoothed) points</span><input id="tRaw" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
@@ -217,7 +216,7 @@ const settings = {
   frameTight: 2.6,    // crop width as a multiple of face width (lower = tighter)
   margin: 0,          // fine zoom/margin trim: +% = more breathing room, -% = tighter
   glide: 0.06,        // camera follow speed (per 60 FPS frame)
-  intensity: 0.85,    // eye-contact correction strength 0..1
+  intensity: 1.0,     // eye-contact correction strength 0..1
   lid: 0.7,           // eyelid lift 0..1 (lowered lids are raised toward a relaxed open eye)
   sync: false,        // draw the exact camera frame the face model analysed (no lag between picture and eyes)
   steady: 0.8,        // 0..1 eye steadiness: higher = eyes hold still, lower = follows tiny movements
@@ -235,7 +234,7 @@ function bindUI() {
     settings.intensity  = $('intensity').value / 100;
     settings.lid        = $('lid').value / 100;
     settings.steady     = $('steady').value / 100;
-    settings.sync       = $('tSync').checked;
+    settings.sync       = false;
     settings.eyeFix      = $('tEyeFix').checked;
     settings.showEyes    = $('tEyes').checked;
     settings.showOutline = $('tOutline').checked;
@@ -374,8 +373,8 @@ function updateCam(vw, vh, faceBox, k) {
    flickers. Cost: two patches of roughly 100x70 px per frame, well under 1 ms.
    =========================================================================== */
 const EYES = [
-  { contour: IDX.eyeA, corners: [33, 133],  lids: [159, 145], iris: IDX.irisA, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0 }, stab: null },
-  { contour: IDX.eyeB, corners: [362, 263], lids: [386, 374], iris: IDX.irisB, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0 }, stab: null },
+  { contour: IDX.eyeA, corners: [33, 133],  lids: [159, 145], iris: IDX.irisA, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0, col: null, scl: null }, stab: null },
+  { contour: IDX.eyeB, corners: [362, 263], lids: [386, 374], iris: IDX.irisB, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0, col: null, scl: null }, stab: null },
 ];
 
 // Tunables (fractions of eye width `ew` unless noted)
@@ -453,6 +452,80 @@ const softDead = (cur, target, dead) => {
   return m <= dead ? cur : cur + Math.sign(d) * (m - dead);
 };
 
+// ---------- GAZE LOCK: re-draw the iris at the centre of the eye ----------
+// pure pixel pass (also unit-tested outside the browser)
+function lockIris(dst, s, mask, pw, ph, o) {
+  const R = o.r;
+  const x0 = Math.max(0, Math.floor(Math.min(o.ox, o.nx) - R * 1.3));
+  const x1 = Math.min(pw - 1, Math.ceil(Math.max(o.ox, o.nx) + R * 1.3));
+  const y0 = Math.max(0, Math.floor(Math.min(o.oy, o.ny) - R * 1.3));
+  const y1 = Math.min(ph - 1, Math.ceil(Math.max(o.oy, o.ny) + R * 1.3));
+  const dxs = o.nx - o.ox, dys = o.ny - o.oy;
+  const C = o.col, S = o.scl, K = o.k;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const i = (y * pw + x) * 4;
+      const m = mask[i + 3] / 255;                       // 1 inside the eye opening, 0 on the lids/skin
+      if (m < 0.02) continue;
+      const dN = Math.hypot(x - o.nx, y - o.ny);
+      const dO = Math.hypot(x - o.ox, y - o.oy);
+      const cN = 1 - sstep(R * 0.88, R * 1.04, dN);      // coverage of the NEW iris
+      const cO = 1 - sstep(R * 1.08, R * 1.30, dO);      // coverage of the OLD iris (erased slightly wider)
+      if (cN <= 0 && cO <= 0) continue;
+      let r = s[i], g = s[i + 1], b = s[i + 2];
+      // 1) erase the old iris: paint the white of the eye over it
+      if (cO > 0) {
+        const t = cO * m * K;
+        r += (S[0] - r) * t; g += (S[1] - g) * t; b += (S[2] - b) * t;
+      }
+      // 2) paint the new iris
+      if (cN > 0) {
+        let ir_, ig, ib;
+        const sx = x - dxs, sy = y - dys;                // where this iris pixel came from
+        const six = Math.round(sx), siy = Math.round(sy);
+        let ok = false;
+        if (six >= 0 && siy >= 0 && six < pw && siy < ph &&
+            Math.hypot(sx - o.ox, sy - o.oy) < R * 0.97 && mask[(siy * pw + six) * 4 + 3] > 200) {
+          const j = (siy * pw + six) * 4;                // real iris texture (pupil, highlight, pattern)
+          ir_ = s[j]; ig = s[j + 1]; ib = s[j + 2]; ok = true;
+        }
+        if (!ok) {                                       // that part was hidden under the lid: synthesise it
+          const sh = (0.55 + 0.45 * sstep(0.15 * R, 0.85 * R, dN)) * (1 - 0.25 * sstep(0.8 * R, R, dN));
+          ir_ = C[0] * sh; ig = C[1] * sh; ib = C[2] * sh;
+        }
+        const t = cN * m * K;
+        r += (ir_ - r) * t; g += (ig - g) * t; b += (ib - b) * t;
+      }
+      dst[i] = r; dst[i + 1] = g; dst[i + 2] = b;
+    }
+  }
+}
+
+// mean colour of the visible iris and of the white of the eye (inside the opening mask)
+function sampleEyeColors(s, mask, pw, ph, cx, cy, r) {
+  let ir = 0, ig = 0, ib = 0, ni = 0;
+  const wl = [];
+  const x0 = Math.max(0, Math.floor(cx - r * 2.6)), x1 = Math.min(pw - 1, Math.ceil(cx + r * 2.6));
+  const y0 = Math.max(0, Math.floor(cy - r * 2.0)), y1 = Math.min(ph - 1, Math.ceil(cy + r * 2.0));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const i = (y * pw + x) * 4;
+    if (mask[i + 3] < 230) continue;
+    const d = Math.hypot(x - cx, y - cy);
+    if (d < r * 0.6) { ir += s[i]; ig += s[i + 1]; ib += s[i + 2]; ni++; }
+    else if (d > r * 1.25) wl.push(i);
+  }
+  let scl = null;
+  if (wl.length >= 12) {
+    let mean = 0;
+    for (const i of wl) mean += s[i] + s[i + 1] + s[i + 2];
+    mean /= wl.length;
+    let r2 = 0, g2 = 0, b2 = 0, n2 = 0;
+    for (const i of wl) if (s[i] + s[i + 1] + s[i + 2] >= mean) { r2 += s[i]; g2 += s[i + 1]; b2 += s[i + 2]; n2++; }
+    if (n2) scl = [r2 / n2, g2 / n2, b2 / n2];
+  }
+  return { iris: ni >= 12 ? [ir / ni, ig / ni, ib / ni] : null, scl };
+}
+
 function correctEye(eye, pts, k) {
   const sp = stabilizeEye(eye, pts, k);
   const P = (i) => toCanvas(sp[i]);
@@ -469,97 +542,73 @@ function correctEye(eye, pts, k) {
   const oc = { x: (top.x + bot.x) / 2, y: (top.y + bot.y) / 2 };   // middle of the lid opening
   const ec = { x: (c0.x + c1.x) / 2, y: (c0.y + c1.y) / 2 };       // middle between the corners
   const eh = Math.hypot(top.x - bot.x, top.y - bot.y);
-  const toA = (q) => (q.x - oc.x) * u.x + (q.y - oc.y) * u.y;      // along the eye
-  const toB = (q) => (q.x - oc.x) * n.x + (q.y - oc.y) * n.y;      // along "down"
+  const toA = (q) => (q.x - oc.x) * u.x + (q.y - oc.y) * u.y;
+  const toB = (q) => (q.x - oc.x) * n.x + (q.y - oc.y) * n.y;
 
   // --- iris center + radius (canvas px) ---
   const ic = P(eye.iris[0]);
   let ir = 0;
   for (let i = 1; i < 5; i++) { const r = P(eye.iris[i]); ir += Math.hypot(r.x - ic.x, r.y - ic.y); }
   ir = Math.max(4, ir / 4);
-  // the radius from 4 noisy ring points flickers; track it slowly (the iris size never really changes)
   eye.st.ir = eye.st.ir ? eye.st.ir + (ir - eye.st.ir) * dtAlpha(0.04, k) : ir;
   ir = eye.st.ir;
 
-  const bI = toB(ic);                                  // iris center: + = below the middle of the opening
-  const bTop = toB(top), bBot = toB(bot);              // upper lid (-) and lower lid (+)
-  const offU = (ic.x - ec.x) * u.x + (ic.y - ec.y) * u.y;
-
-  // --- blink factor: fade everything to 0 as the eye closes ---
   const ratio = eh / ew;
-  const open = sstep(0.11, 0.22, ratio);
-
-  // --- GAZE GUARD: only correct the "reading the screen" look ---
-  // The fix is meant for a gaze that sits a little BELOW neutral. If you deliberately look up,
-  // far down or to the side, the correction would fight your real gaze (iris dragged back,
-  // lids forced open), which is what made the eyes jump. So it fades out in those cases.
-  const wantRaw = bI + EYE_FIX.neutralHigh * ir;               // + = iris below neutral
-  const gUp   = sstep(0.004 * ew, 0.025 * ew, wantRaw);        // looking up / straight: no correction
-  const gDown = 1 - sstep(0.07 * ew, 0.13 * ew, wantRaw);      // looking far down: leave it alone
-  const gSide = 1 - sstep(0.10 * ew, 0.20 * ew, Math.abs(offU)); // looking sideways: leave it alone
-  const gT = gUp * gDown * gSide;
-  // fast release (react at once when you look away), slow attack (no popping when you come back)
-  eye.st.g += (gT - eye.st.g) * dtAlpha(gT < eye.st.g ? 0.5 : 0.08, k);
-  const g = eye.st.g;
-
-  const I = settings.intensity * open * g;
+  const open = sstep(0.11, 0.22, ratio);                // fade everything out while blinking
   const a = dtAlpha(lerp(EYE_FIX.shiftSmooth, 0.05, settings.steady), k);
-  const rel = dtAlpha(0.35, k);                                // releasing a correction is never slowed down
+  const rel = dtAlpha(0.35, k);
 
-  // --- B. eyelid lift: how much the upper lid is lowered compared to a relaxed open eye ---
-  const openLid = sstep(0.07, 0.13, ratio);            // the lid lift fades out only for real blinks, not for lowered lids
-  const lidT = clamp((EYE_FIX.openRatio - ratio) * ew, 0, EYE_FIX.maxLid * ew) * settings.lid * openLid * g;
+  // --- B. eyelid lift (lowered lids are eased up toward a relaxed open eye) ---
+  const openLid = sstep(0.07, 0.13, ratio);
+  const lidT = clamp((EYE_FIX.openRatio - ratio) * ew, 0, EYE_FIX.maxLid * ew) * settings.lid * openLid;
   eye.st.lid += (softDead(eye.st.lid, lidT, 0.4) - eye.st.lid) * (lidT < eye.st.lid ? Math.max(a, rel) : a);
   const lid = eye.st.lid;
-
-  // --- A. iris to neutral: toward just above the middle of the opening, never past it ---
-  const want = clamp(bI + EYE_FIX.neutralHigh * ir, -EYE_FIX.maxMove * ew, EYE_FIX.maxMove * ew);
-  let lo = bTop - lid + EYE_FIX.minVisible * ir;       // highest the iris center may go (stays under the lid)
-  let hi = bBot - 0.5 * ir;                            // lowest it may go
-  if (lo > hi) lo = hi = (lo + hi) / 2;
-  const move = want * I;
-  let bAfter = bI - move;
-  bAfter = move >= 0 ? Math.min(bI, Math.max(bAfter, lo)) : Math.max(bI, Math.min(bAfter, hi));
-  const rise = bI - bAfter;                            // + = iris content moves up
-
-  const horiz = -clamp(offU * EYE_FIX.horizPull, -EYE_FIX.maxHoriz * ew, EYE_FIX.maxHoriz * ew) * I;
-  const tx = u.x * horiz - n.x * rise;
-  const ty = u.y * horiz - n.y * rise;
-
-  // --- low-pass the iris shift so it never flickers ---
-  const dz = 0.5 * settings.steady;                    // px of change we simply ignore
-  const aS = Math.hypot(tx, ty) < Math.hypot(eye.st.x, eye.st.y) ? Math.max(a, rel) : a;
-  eye.st.x += (softDead(eye.st.x, tx, dz) - eye.st.x) * aS;
-  eye.st.y += (softDead(eye.st.y, ty, dz) - eye.st.y) * aS;
-  const shx = eye.st.x, shy = eye.st.y;
   const lidOn = lid >= 0.2;
-  if (Math.hypot(shx, shy) < 0.2 && !lidOn) return 0;
 
-  // --- eyelid curves in eye coordinates (a along the eye, b down), from the contour landmarks ---
-  // contour order: corner -> lower lid -> opposite corner (idx 0..8), then back along the upper lid (idx 8..15)
+  // --- A. GAZE LOCK: wherever you really look (up, down, left, right), the iris is drawn at the
+  //        centre of the eye opening, i.e. looking straight into the lens. The target comes from
+  //        the eye corners and lids only, so noise in the iris landmark cannot make it shake.
+  const aT = toA(ec);
+  const tcx = oc.x + u.x * aT - n.x * EYE_FIX.neutralHigh * ir;
+  const tcy = oc.y + u.y * aT - n.y * EYE_FIX.neutralHigh * ir;
+  let sx = (tcx - ic.x) * settings.intensity, sy = (tcy - ic.y) * settings.intensity;
+  let mv = Math.hypot(sx, sy);
+  const mvMax = 0.38 * ew;
+  if (mv > mvMax) { sx *= mvMax / mv; sy *= mvMax / mv; mv = mvMax; }
+  const kk = open * sstep(0.6, 3, mv);                  // nothing to do when the iris is already centred
+  eye.st.g += (kk - eye.st.g) * dtAlpha(kk < eye.st.g ? 0.5 : 0.5, k);
+  const g = eye.st.g;
+  const lockOn = g > 0.02;
+  eye.st.x = sx; eye.st.y = sy;
+  if (!lockOn && !lidOn) return 0;
+
+  // --- eyelid curves in eye coordinates ---
   const C = eye.contour.map((i) => { const q = P(i); return { a: toA(q), b: toB(q) }; });
   const lower = C.slice(0, 9).sort((p, q) => p.a - q.a);
   const upper = C.slice(8).concat([C[0]]).sort((p, q) => p.a - q.a);
 
-  // --- patch = eye contour bounding box + feather padding (+ room above for the lid lift) ---
+  // --- patch = eye contour bounding box + both iris positions + feather padding ---
   const blur = clamp(ew * 0.07, 3, 10);
   const pad = Math.ceil(blur * 1.5) + 2;
   const up = Math.ceil((EYE_FIX.feather + 0.05) * ew) + 2;
   let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
   const poly = eye.contour.map((i) => {
     const q = P(i);
-    // inset the eyelid polygon (more vertically than horizontally) so lids/lashes stay untouched by the iris move
     const dx = q.x - oc.x, dy = q.y - oc.y;
     const a2 = (dx * u.x + dy * u.y) * 0.96, b2 = (dx * n.x + dy * n.y) * 0.86;
     if (q.x < x0) x0 = q.x; if (q.x > x1) x1 = q.x;
     if (q.y < y0) y0 = q.y; if (q.y > y1) y1 = q.y;
     return { x: oc.x + u.x * a2 + n.x * b2, y: oc.y + u.y * a2 + n.y * b2 };
   });
+  for (const c of [ic, { x: ic.x + sx, y: ic.y + sy }]) {   // make sure both iris positions are inside the patch
+    x0 = Math.min(x0, c.x - ir * 1.4); x1 = Math.max(x1, c.x + ir * 1.4);
+    y0 = Math.min(y0, c.y - ir * 1.4); y1 = Math.max(y1, c.y + ir * 1.4);
+  }
   const px = Math.max(0, Math.floor(x0 - pad)), py = Math.max(0, Math.floor(y0 - pad - (lidOn ? up : 0)));
   const pw = Math.min(W, Math.ceil(x1 + pad)) - px, ph = Math.min(H, Math.ceil(y1 + pad)) - py;
   if (pw < 8 || ph < 8 || pw > MASK_W || ph > MASK_H) return 0;
 
-  // --- soft eye mask: blurred shadow of the inset eyelid polygon ---
+  // --- soft eye mask: blurred shadow of the inset eyelid polygon (lids stay in front of the iris) ---
   maskCtx.clearRect(0, 0, MASK_W, MASK_H);
   maskCtx.save();
   maskCtx.shadowColor = '#000';
@@ -576,71 +625,61 @@ function correctEye(eye, pts, k) {
   maskCtx.restore();
   const mask = maskCtx.getImageData(0, 0, pw, ph).data;
 
-  // --- read the patch, warp it, write it back ---
   const img = ctx.getImageData(px, py, pw, ph);
   const dst = img.data;
   srcCopy.set(dst);
   const s = srcCopy;
 
-  const icx = ic.x - px, icy = ic.y - py;
-  const Rin = ir * 1.05, Rout = ir * 2.4, Rout2 = Rout * Rout;
-  const maxX = pw - 1.001, maxY = ph - 1.001;
-  const featherPx = EYE_FIX.feather * ew;
+  // --- A. redraw the iris in the centre ---
+  if (lockOn) {
+    const cs = sampleEyeColors(s, mask, pw, ph, ic.x - px, ic.y - py, ir);
+    const mixC = (old, nw) => (old ? old.map((v, i) => v + (nw[i] - v) * 0.12) : nw.slice());
+    if (cs.iris) eye.st.col = mixC(eye.st.col, cs.iris);   // remembered, so a hidden iris still has a colour
+    if (cs.scl)  eye.st.scl = mixC(eye.st.scl, cs.scl);
+    if (eye.st.col && eye.st.scl) {
+      lockIris(dst, s, mask, pw, ph, {
+        ox: ic.x - px, oy: ic.y - py, nx: ic.x + sx - px, ny: ic.y + sy - py,
+        r: ir, col: eye.st.col, scl: eye.st.scl, k: clamp(g, 0, 1),
+      });
+      s.set(dst);
+    }
+  }
 
-  for (let y = 0; y < ph; y++) {
-    const dy = y - icy;
-    for (let x = 0; x < pw; x++) {
-      // A. iris weight: 1 on the iris, so it moves as one rigid disc and is never stretched;
-      //    easing to 0 over the nearby white and toward the lids, where the lid field takes over
-      let w = 0;
-      const dx = x - icx, d2 = dx * dx + dy * dy;
-      if (d2 < Rout2) {
-        const m = mask[(y * pw + x) * 4 + 3];
-        if (m >= 6) w = Math.min(1, (m / 255) * 1.6) * (1 - sstep(Rin, Rout, Math.sqrt(d2)));
-      }
-
-      // B. eyelid lift field: content moves up, strongest at the upper lid, fading below it and above it
-      let D = 0;
-      if (lidOn) {
+  // --- B. eyelid lift field: content moves up, strongest at the upper lid ---
+  if (lidOn) {
+    const maxX = pw - 1.001, maxY = ph - 1.001;
+    const featherPx = EYE_FIX.feather * ew;
+    for (let y = 0; y < ph; y++) {
+      for (let x = 0; x < pw; x++) {
         const X = x + px - oc.x, Y = y + py - oc.y;
         const aa = X * u.x + Y * u.y;
         const frac = Math.abs(aa) / ew;
-        if (frac < 0.5) {
-          const bt = lidAt(upper, aa), bb = lidAt(lower, aa);
-          const col = bb - bt;                                    // lid opening at this column
-          if (col > 1) {
-            const b = X * n.x + Y * n.y;
-            const dl = Math.min(lid, 0.45 * col) * (1 - sstep(0.30, 0.50, frac));
-            if (dl > 0.01) {
-              // flat across the strip the lid travels through (so the lid edge moves the full amount),
-              // then feathered up toward the brow; below the lid it fades out over the eye opening
-              let prof;
-              if (b < bt - dl) prof = sstep(bt - dl - featherPx, bt - dl, b);
-              else if (b < bt) prof = 1;
-              else prof = 1 - sstep(bt, bb, b);
-              D = dl * prof;
-            }
-          }
+        if (frac >= 0.5) continue;
+        const bt = lidAt(upper, aa), bb = lidAt(lower, aa);
+        const col = bb - bt;
+        if (col <= 1) continue;
+        const b = X * n.x + Y * n.y;
+        const dl = Math.min(lid, 0.45 * col) * (1 - sstep(0.30, 0.50, frac));
+        if (dl <= 0.01) continue;
+        let prof;
+        if (b < bt - dl) prof = sstep(bt - dl - featherPx, bt - dl, b);
+        else if (b < bt) prof = 1;
+        else prof = 1 - sstep(bt, bb, b);
+        const D = dl * prof;
+        if (D < 0.01) continue;
+        const qx = clamp(x + n.x * D, 0, maxX), qy = clamp(y + n.y * D, 0, maxY);
+        const ix = qx | 0, iy = qy | 0, fx = qx - ix, fy = qy - iy;
+        const i00 = (iy * pw + ix) * 4, i10 = i00 + 4, i01 = i00 + pw * 4, i11 = i01 + 4;
+        const o = (y * pw + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          dst[o + c] = (s[i00 + c] * (1 - fx) + s[i10 + c] * fx) * (1 - fy)
+                     + (s[i01 + c] * (1 - fx) + s[i11 + c] * fx) * fy;
         }
-      }
-
-      // blend: the iris disc takes the (rigid) iris shift, everything else takes the lid field
-      const dLid = D * (1 - w);
-      if (dLid < 0.01 && w < 0.01) continue;
-
-      // backward mapping with bilinear sampling
-      const sx = clamp(x + n.x * dLid - shx * w, 0, maxX), sy = clamp(y + n.y * dLid - shy * w, 0, maxY);
-      const ix = sx | 0, iy = sy | 0, fx = sx - ix, fy = sy - iy;
-      const i00 = (iy * pw + ix) * 4, i10 = i00 + 4, i01 = i00 + pw * 4, i11 = i01 + 4;
-      const o = (y * pw + x) * 4;
-      for (let c = 0; c < 3; c++) {
-        dst[o + c] = (s[i00 + c] * (1 - fx) + s[i10 + c] * fx) * (1 - fy)
-                   + (s[i01 + c] * (1 - fx) + s[i11 + c] * fx) * fy;
       }
     }
   }
   ctx.putImageData(img, px, py);
-  return Math.max(Math.hypot(shx, shy), lid);
+  return Math.max(mv * g, lid);
 }
 
 /* ===========================================================================
@@ -831,7 +870,7 @@ function grabFrame() {
 }
 
 function pickMime() {
-  const list = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4;codecs=avc1', 'video/mp4'];
+  const list = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp8', 'video/webm', 'video/webm;codecs=vp9'];
   return list.find((t) => MediaRecorder.isTypeSupported(t)) || '';
 }
 
@@ -878,7 +917,7 @@ function startRecording() {
 
   try {
     rec.stream = recCv.captureStream(30);
-    const opts = { videoBitsPerSecond: 3000000 };
+    const opts = { videoBitsPerSecond: 2500000 };
     if (rec.mime) opts.mimeType = rec.mime;
     rec.recorder = new MediaRecorder(rec.stream, opts);
   } catch (e) {
@@ -999,11 +1038,17 @@ async function start() {
     // on a phone left only 2-4 drawn frames per second (choppy video = "unstable" eyes).
     // So it is capped to ~15 runs per second; the render loop keeps the picture at full
     // speed and glides the eyes between model results.
-    let busy = false, lastInfer = 0;
-    const INFER_GAP = 66;
+    // The model input is also shrunk to 640 px wide (the model works on small crops anyway),
+    // and the pause between runs adapts to how slow this phone is: the model may only use
+    // about 40% of the time, the rest is kept for drawing a smooth picture.
+    const aiCv = document.createElement('canvas');
+    aiCv.width = 640; aiCv.height = 360;
+    const aiCx = aiCv.getContext('2d');
+    let busy = false, lastInfer = 0, inferGap = 66;
     const infer = async (t) => {
-      if (!busy && video.readyState >= 2 && t - lastInfer >= INFER_GAP) {
+      if (!busy && video.readyState >= 2 && t - lastInfer >= inferGap) {
         busy = true; lastInfer = t;
+        const t0 = performance.now();
         try {
           if (settings.sync) {
             const bmp = await createImageBitmap(video);   // freeze this frame so picture and landmarks match
@@ -1011,9 +1056,12 @@ async function start() {
             await faceMesh.send({ image: bmp });
             if (inflightFrame === bmp) { bmp.close(); inflightFrame = null; }
           } else {
-            await faceMesh.send({ image: video });
+            aiCx.drawImage(video, 0, 0, aiCv.width, aiCv.height);
+            await faceMesh.send({ image: aiCv });
           }
         } catch (e) { console.error(e); if (inflightFrame) { inflightFrame.close(); inflightFrame = null; } }
+        const took = performance.now() - t0;
+        inferGap = clamp(took * 1.5, 66, 350);          // slow phone -> model runs less often
         busy = false;
       }
       requestAnimationFrame(infer);
