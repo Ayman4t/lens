@@ -54,7 +54,7 @@
       <!-- ============ STAGE ============ -->
       <section class="glass rounded-2xl p-3">
         <div id="stage" class="relative rounded-xl overflow-hidden bg-black aspect-video">
-          <canvas id="output" width="1280" height="720" class="w-full h-full block"></canvas>
+          <canvas id="output" width="960" height="540" class="w-full h-full block"></canvas>
 
           <!-- Start overlay -->
           <div id="startOverlay" class="absolute inset-0 grid place-items-center bg-ink/80">
@@ -165,7 +165,7 @@
             <input id="steady" type="range" min="0" max="100" value="80" />
           </label>
 
-          <label class="flex items-center justify-between text-sm"><span>Sync picture to tracking</span><input id="tSync" type="checkbox" checked class="accent-cyan-400 w-4 h-4" /></label>
+          <label class="flex items-center justify-between text-sm"><span>Sync picture to tracking</span><input id="tSync" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Eye markers</span><input id="tEyes" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Face outline</span><input id="tOutline" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
           <label class="flex items-center justify-between text-sm"><span>Raw (unsmoothed) points</span><input id="tRaw" type="checkbox" class="accent-cyan-400 w-4 h-4" /></label>
@@ -219,7 +219,7 @@ const settings = {
   glide: 0.06,        // camera follow speed (per 60 FPS frame)
   intensity: 0.85,    // eye-contact correction strength 0..1
   lid: 0.7,           // eyelid lift 0..1 (lowered lids are raised toward a relaxed open eye)
-  sync: true,         // draw the exact camera frame the face model analysed (no lag between picture and eyes)
+  sync: false,        // draw the exact camera frame the face model analysed (no lag between picture and eyes)
   steady: 0.8,        // 0..1 eye steadiness: higher = eyes hold still, lower = follows tiny movements
   eyeFix: true,
   showEyes: false, showOutline: false, showRaw: false, autoFrame: true,
@@ -737,7 +737,7 @@ function onResults(results) {
   if (raw) lastFaceTime = performance.now();
 }
 
-let lastT = performance.now(), miniToggle = false;
+let lastT = performance.now(), miniCount = 0;
 
 function render(now) {
   requestAnimationFrame(render);
@@ -792,7 +792,7 @@ function render(now) {
   }
 
   // minimap at half rate (cheap, and nobody can tell)
-  if ((miniToggle = !miniToggle)) drawMinimap(box);
+  if ((++miniCount % 8) === 0) drawMinimap(box);
 
   // --- HUD (updated twice a second) ---
   renderFrames++;
@@ -971,7 +971,7 @@ async function start() {
   try {
     setStatus('Requesting camera…', 'bg-amber-400');
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 }, facingMode: 'user' },
+      video: { width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30, max: 30 }, facingMode: 'user' },
       audio: false,
     });
     video.srcObject = stream;
@@ -995,21 +995,30 @@ async function start() {
     recBtn.disabled = false;                     // recording needs a running camera
 
     // Inference loop: one frame at a time, skipped while the model is busy
-    let busy = false;
-    const infer = async () => {
-      if (!busy && video.readyState >= 2) {
-        busy = true;
+    // The face model is heavy and shares the main thread with drawing. Running it flat out
+    // on a phone left only 2-4 drawn frames per second (choppy video = "unstable" eyes).
+    // So it is capped to ~15 runs per second; the render loop keeps the picture at full
+    // speed and glides the eyes between model results.
+    let busy = false, lastInfer = 0;
+    const INFER_GAP = 66;
+    const infer = async (t) => {
+      if (!busy && video.readyState >= 2 && t - lastInfer >= INFER_GAP) {
+        busy = true; lastInfer = t;
         try {
-          const bmp = await createImageBitmap(video);   // freeze this frame so picture and landmarks match
-          inflightFrame = bmp;
-          await faceMesh.send({ image: bmp });
-          if (inflightFrame === bmp) { bmp.close(); inflightFrame = null; }
+          if (settings.sync) {
+            const bmp = await createImageBitmap(video);   // freeze this frame so picture and landmarks match
+            inflightFrame = bmp;
+            await faceMesh.send({ image: bmp });
+            if (inflightFrame === bmp) { bmp.close(); inflightFrame = null; }
+          } else {
+            await faceMesh.send({ image: video });
+          }
         } catch (e) { console.error(e); if (inflightFrame) { inflightFrame.close(); inflightFrame = null; } }
         busy = false;
       }
       requestAnimationFrame(infer);
     };
-    infer();
+    requestAnimationFrame(infer);
     requestAnimationFrame(render);
   } catch (err) {
     console.error(err);
