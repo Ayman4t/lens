@@ -371,8 +371,8 @@ function updateCam(vw, vh, faceBox, k) {
    flickers. Cost: two patches of roughly 100x70 px per frame, well under 1 ms.
    =========================================================================== */
 const EYES = [
-  { contour: IDX.eyeA, corners: [33, 133],  lids: [159, 145], iris: IDX.irisA, st: { x: 0, y: 0, lid: 0, ir: 0 }, stab: null },
-  { contour: IDX.eyeB, corners: [362, 263], lids: [386, 374], iris: IDX.irisB, st: { x: 0, y: 0, lid: 0, ir: 0 }, stab: null },
+  { contour: IDX.eyeA, corners: [33, 133],  lids: [159, 145], iris: IDX.irisA, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0 }, stab: null },
+  { contour: IDX.eyeB, corners: [362, 263], lids: [386, 374], iris: IDX.irisB, st: { x: 0, y: 0, lid: 0, ir: 0, g: 0 }, stab: null },
 ];
 
 // Tunables (fractions of eye width `ew` unless noted)
@@ -485,13 +485,28 @@ function correctEye(eye, pts, k) {
   // --- blink factor: fade everything to 0 as the eye closes ---
   const ratio = eh / ew;
   const open = sstep(0.11, 0.22, ratio);
-  const I = settings.intensity * open;
+
+  // --- GAZE GUARD: only correct the "reading the screen" look ---
+  // The fix is meant for a gaze that sits a little BELOW neutral. If you deliberately look up,
+  // far down or to the side, the correction would fight your real gaze (iris dragged back,
+  // lids forced open), which is what made the eyes jump. So it fades out in those cases.
+  const wantRaw = bI + EYE_FIX.neutralHigh * ir;               // + = iris below neutral
+  const gUp   = sstep(0.004 * ew, 0.025 * ew, wantRaw);        // looking up / straight: no correction
+  const gDown = 1 - sstep(0.07 * ew, 0.13 * ew, wantRaw);      // looking far down: leave it alone
+  const gSide = 1 - sstep(0.10 * ew, 0.20 * ew, Math.abs(offU)); // looking sideways: leave it alone
+  const gT = gUp * gDown * gSide;
+  // fast release (react at once when you look away), slow attack (no popping when you come back)
+  eye.st.g += (gT - eye.st.g) * dtAlpha(gT < eye.st.g ? 0.5 : 0.08, k);
+  const g = eye.st.g;
+
+  const I = settings.intensity * open * g;
   const a = dtAlpha(lerp(EYE_FIX.shiftSmooth, 0.05, settings.steady), k);
+  const rel = dtAlpha(0.35, k);                                // releasing a correction is never slowed down
 
   // --- B. eyelid lift: how much the upper lid is lowered compared to a relaxed open eye ---
   const openLid = sstep(0.07, 0.13, ratio);            // the lid lift fades out only for real blinks, not for lowered lids
-  const lidT = clamp((EYE_FIX.openRatio - ratio) * ew, 0, EYE_FIX.maxLid * ew) * settings.lid * openLid;
-  eye.st.lid += (softDead(eye.st.lid, lidT, 0.4) - eye.st.lid) * a;
+  const lidT = clamp((EYE_FIX.openRatio - ratio) * ew, 0, EYE_FIX.maxLid * ew) * settings.lid * openLid * g;
+  eye.st.lid += (softDead(eye.st.lid, lidT, 0.4) - eye.st.lid) * (lidT < eye.st.lid ? Math.max(a, rel) : a);
   const lid = eye.st.lid;
 
   // --- A. iris to neutral: toward just above the middle of the opening, never past it ---
@@ -510,8 +525,9 @@ function correctEye(eye, pts, k) {
 
   // --- low-pass the iris shift so it never flickers ---
   const dz = 0.5 * settings.steady;                    // px of change we simply ignore
-  eye.st.x += (softDead(eye.st.x, tx, dz) - eye.st.x) * a;
-  eye.st.y += (softDead(eye.st.y, ty, dz) - eye.st.y) * a;
+  const aS = Math.hypot(tx, ty) < Math.hypot(eye.st.x, eye.st.y) ? Math.max(a, rel) : a;
+  eye.st.x += (softDead(eye.st.x, tx, dz) - eye.st.x) * aS;
+  eye.st.y += (softDead(eye.st.y, ty, dz) - eye.st.y) * aS;
   const shx = eye.st.x, shy = eye.st.y;
   const lidOn = lid >= 0.2;
   if (Math.hypot(shx, shy) < 0.2 && !lidOn) return 0;
@@ -750,7 +766,7 @@ function render(now) {
     const active = settings.eyeFix && !settings.bypass && settings.intensity > 0.005;
     for (const eye of EYES) {
       if (active) lift += correctEye(eye, pts, k);
-      else { eye.st.x = 0; eye.st.y = 0; eye.st.lid = 0; eye.st.ir = 0; eye.stab = null; }
+      else { eye.st.x = 0; eye.st.y = 0; eye.st.lid = 0; eye.st.ir = 0; eye.st.g = 0; eye.stab = null; }
     }
     lift /= 2;
   }
